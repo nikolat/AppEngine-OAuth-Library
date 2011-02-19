@@ -56,6 +56,7 @@ from time import time
 from urllib import urlencode
 from urllib import quote as urlquote
 from urllib import unquote as urlunquote
+from urllib import quote_plus
 
 import logging
 
@@ -65,7 +66,7 @@ YAHOO = "yahoo"
 MYSPACE = "myspace"
 DROPBOX = "dropbox"
 LINKEDIN = "linkedin"
-
+HATENA = "hatena"
 
 class OAuthException(Exception):
   pass
@@ -87,6 +88,8 @@ def get_oauth_client(service, key, secret, callback_url):
     return DropboxClient(key, secret, callback_url)
   elif service == LINKEDIN:
     return LinkedInClient(key, secret, callback_url)
+  elif service == HATENA:
+    return HatenaClient(key, secret, callback_url)
   else:
     raise Exception, "Unknown OAuth service %s" % service
 
@@ -161,13 +164,39 @@ class OAuthClient():
                        encode(url), encode(params_str)])
 
     # Create a HMAC-SHA1 signature of the message.
-    key = "%s&%s" % (self.consumer_secret, secret) # Note compulsory "&".
+    key = "%s&%s" % (encode(self.consumer_secret), encode(secret)) # Note compulsory "&".
     signature = hmac(key, message, sha1)
     digest_base64 = signature.digest().encode("base64").strip()
     params["oauth_signature"] = digest_base64
+    
+    oauth_params = {
+        "realm": "",
+        "oauth_consumer_key": params["oauth_consumer_key"],
+        "oauth_nonce": params["oauth_nonce"],
+        "oauth_signature": params["oauth_signature"],
+        "oauth_signature_method": params["oauth_signature_method"],
+        "oauth_timestamp": params["oauth_timestamp"],
+        "oauth_version": "1.0",
+    }
+    
+    if "oauth_token" in params:
+        oauth_params["oauth_token"] = params["oauth_token"]
+    elif "oauth_callback" in params:
+        oauth_params["oauth_callback"] = params["oauth_callback"]
+
+    oauth_headers = []
+    for (k,v) in oauth_params.items():
+        oauth_headers.append('%s="%s"' % (k,encode(v)))
+    authorization = "OAuth %s" % ",".join(oauth_headers)
+    if additional_params:
+        for k,v in additional_params.items():
+            if isinstance(v, unicode):
+                additional_params[k] = v.encode('utf8')
+    else:
+        additional_params = {}
 
     # Construct the request payload and return it
-    return urlencode(params)
+    return (urlencode(params), urlencode(additional_params), authorization)
 
   def make_async_request(self, url, token="", secret="", additional_params=None,
                          protected=False, method=urlfetch.GET, headers={}):
@@ -180,15 +209,21 @@ class OAuthClient():
     A urlfetch response object is returned.
     """
 
-    payload = self.prepare_request(url, token, secret, additional_params,
+    (payload, payload_protectd, authorization) = self.prepare_request(url, token, secret, additional_params,
                                    method)
 
-    if method == urlfetch.GET:
-      url = "%s?%s" % (url, payload)
-      payload = None
-
-    if protected:
-      headers["Authorization"] = "OAuth"
+    if not protected:
+      if method == urlfetch.GET:
+        url = "%s?%s" % (url, payload)
+        payload = None
+    else:
+      headers["Authorization"] = authorization
+      if method == urlfetch.GET:
+        payload = None
+        if payload_protectd:
+          url = "%s?%s" % (url, payload_protectd)
+      elif method == urlfetch.POST:
+        payload = payload_protectd
 
     rpc = urlfetch.create_rpc(deadline=10.0)
     urlfetch.make_fetch_call(rpc, url, method=method, headers=headers,
@@ -196,7 +231,7 @@ class OAuthClient():
     return rpc
 
   def make_request(self, url, token="", secret="", additional_params=None,
-                   protected=False, method=urlfetch.GET, headers={}):
+                   protected=True, method=urlfetch.GET, headers={}):
 
     return self.make_async_request(url, token, secret, additional_params,
                                    protected, method, headers).get_result()
@@ -253,7 +288,7 @@ class OAuthClient():
 
     return user_info
 
-  def _get_auth_token(self):
+  def _get_auth_token(self, additional_params=None):
     """Get Authorization Token.
 
     Actually gets the authorization token and secret from the service. The
@@ -261,7 +296,7 @@ class OAuthClient():
     returned.
     """
 
-    response = self.make_request(self.request_url)
+    response = self.make_request(self.request_url, additional_params=additional_params)
     result = self._extract_credentials(response)
 
     auth_token = result["token"]
@@ -580,4 +615,55 @@ class LinkedInClient(OAuthClient):
     user_info["id"] = data["id"]
     user_info["picture"] = data["pictureUrl"]
     user_info["name"] = data["firstName"] + " " + data["lastName"]
+    return user_info
+
+
+class HatenaClient(OAuthClient):
+  """Hatena Client.
+
+  A client for talking to the Hatena API using OAuth as the
+  authentication model.
+  """
+
+  def __init__(self, consumer_key, consumer_secret, callback_url, scope=None):
+    """Constructor."""
+
+    OAuthClient.__init__(self,
+        "hatena",
+        consumer_key,
+        consumer_secret,
+        "https://www.hatena.com/oauth/initiate",
+        "https://www.hatena.com/oauth/token",
+        callback_url)
+    self.scope = scope
+
+  def get_authorization_url(self):
+    """Get Authorization URL."""
+
+    token = self._get_auth_token(additional_params={'scope':self.scope})
+    return "https://www.hatena.com/oauth/authorize?oauth_token=%s" % quote_plus(token)
+
+  def _lookup_user_info(self, access_token, access_secret):
+    """Lookup User Info.
+
+    Lookup the user on Hatena.
+    """
+
+    params = {'scope':self.scope} if self.scope else None
+    response = self.make_request(
+        "http://n.hatena.com/applications/my.json",
+        token=access_token, secret=access_secret, additional_params=params, protected=True)
+
+    if 200 <= response.status_code < 300:
+        data = json.loads(response.content)
+    else:
+        logging.warning(response.content)
+
+    user_info = self._get_default_user_info()
+    if 200 <= response.status_code < 300:
+        user_info["id"] = data["url_name"]
+        user_info["username"] = data["url_name"]
+        user_info["name"] = data["display_name"]
+        user_info["picture"] = data["profile_image_url"]
+
     return user_info
