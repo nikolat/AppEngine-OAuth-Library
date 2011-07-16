@@ -160,8 +160,15 @@ class OAuthClient():
                            for k in sorted(params)])
 
     # Join the entire message together per the OAuth specification.
-    message = "&".join(["GET" if method == urlfetch.GET else "POST",
-                       encode(url), encode(params_str)])
+    if method == urlfetch.POST:
+        methodstr = "POST"
+    elif method == urlfetch.PUT:
+        methodstr = "PUT"
+    elif method == urlfetch.DELETE:
+        methodstr = "DELETE"
+    else:
+        methodstr = "GET"
+    message = "&".join([methodstr, encode(url), encode(params_str)])
 
     # Create a HMAC-SHA1 signature of the message.
     key = "%s&%s" % (encode(self.consumer_secret), encode(secret)) # Note compulsory "&".
